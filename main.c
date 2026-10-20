@@ -24,13 +24,43 @@ the usage of floating point conversion specifier */
 
 
 /* UART COmmunications */
-uint8 errorStatus = 0u;
+volatile uint16_t errorStatus = 0u;
 
 /* command rcv code */
-#define MAX_CMD_SIZE 64
-char rxbuffer[MAX_CMD_SIZE] = {'\0'};
-bool receivingmsg = false;
-bool Isnewcommand = false;
+#define MAX_JSON_SIZE 255u
+#define MAX_CMD_SIZE (MAX_JSON_SIZE + 2u)
+#define RX_ERROR_OVERFLOW 0x100u
+#define RX_ERROR_INVALID_CHARACTER 0x200u
+#define I2C_FIRST_ADDRESS 0x03u
+#define I2C_LAST_ADDRESS 0x77u
+#define I2C_ADDRESS_COUNT (I2C_LAST_ADDRESS - I2C_FIRST_ADDRESS + 1u)
+volatile char rxbuffer[MAX_CMD_SIZE] = {'\0'};
+volatile bool receivingmsg = false;
+volatile bool Isnewcommand = false;
+static uint8_t savedAddresses8bit[I2C_ADDRESS_COUNT];
+static uint8_t savedAddressCount = 0u;
+
+static uint16_t uart_take_command(char *buffer, size_t bufferSize)
+{
+    uint16_t status = errorStatus;
+
+    /* RxIsr leaves the completed buffer untouched until it is consumed. */
+    for(size_t i = 0u; i < bufferSize - 1u; i++)
+    {
+        buffer[i] = rxbuffer[i];
+        if(buffer[i] == '\0')
+        {
+            break;
+        }
+    }
+    buffer[bufferSize - 1u] = '\0';
+
+    uint8 interruptState = CyEnterCriticalSection();
+    errorStatus = 0u;
+    Isnewcommand = false;
+    CyExitCriticalSection(interruptState);
+    return status;
+}
 
 static size_t uart_read_line_blocking(char *buffer, size_t bufferSize)
 {
@@ -39,81 +69,49 @@ static size_t uart_read_line_blocking(char *buffer, size_t bufferSize)
 		return 0u;
 	}
 
-	Isnewcommand = false;
-	receivingmsg = false;
-	rxbuffer[0] = '\0';
-
-	while(!Isnewcommand)
-	{
-		CyDelay(1u);
-	}
-
-	strncpy(buffer, rxbuffer, bufferSize - 1u);
-	buffer[bufferSize - 1u] = '\0';
-	Isnewcommand = false;
+    for(;;)
+    {
+        while(!Isnewcommand)
+        {
+            CyDelay(1u);
+        }
+        if(uart_take_command(buffer, bufferSize) == 0u)
+        {
+            break;
+        }
+        printf("UART receive error. Please retry.\r\n");
+    }
 
 	return strlen(buffer);
 }
 
-static bool i2c_probe_7bit_address(uint8_t address)
+static bool i2c_probe_7bit_address(uint8_t address, uint8_t *scanStatus)
 {
     uint8_t status = I2C_MasterSendStart(address, I2C_WRITE_XFER_MODE);
+    uint8_t stopStatus = I2C_MasterSendStop();
 
-    if(status == I2C_MSTR_NO_ERROR)
+    if((status != I2C_MSTR_NO_ERROR) && (status != I2C_MSTR_ERR_LB_NAK))
     {
-        (void)I2C_MasterSendStop();
-        return true;
+        *scanStatus = status;
+    }
+    else if((stopStatus != I2C_MSTR_NO_ERROR) &&
+            !((status == I2C_MSTR_ERR_LB_NAK) && (stopStatus == I2C_MSTR_NOT_READY)))
+    {
+        *scanStatus = stopStatus;
     }
 
-    (void)I2C_MasterSendStop();
-    return false;
+    return (status == I2C_MSTR_NO_ERROR) && (*scanStatus == I2C_MSTR_NO_ERROR);
 }
 
-static void i2c_scan_and_print_table(void)
-{
-    uint8_t foundCount = 0u;
-
-    printf("\r\nI2C scan (7-bit addresses 0x03..0x77)\r\n");
-    printf("     00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F\r\n");
-
-    for(uint8_t row = 0u; row < 8u; row++)
-    {
-        uint8_t base = (uint8_t)(row << 4);
-        printf("%02X: ", base);
-
-        for(uint8_t col = 0u; col < 16u; col++)
-        {
-            uint8_t addr = (uint8_t)(base + col);
-
-            if((addr < 0x03u) || (addr > 0x77u))
-            {
-                printf("-- ");
-            }
-            else if(i2c_probe_7bit_address(addr))
-            {
-                printf("%02X ", addr);
-                foundCount++;
-            }
-            else
-            {
-                printf("-- ");
-            }
-        }
-
-        printf("\r\n");
-    }
-
-    printf("Detected devices: %u\r\n\r\n", foundCount);
-    
-}
-
-static uint8_t i2c_collect_available_addresses(uint8_t *addresses7bit, uint8_t maxCount)
+static uint8_t i2c_collect_available_addresses(uint8_t *addresses7bit, uint8_t maxCount,
+                                              uint8_t *scanStatus)
 {
 	uint8_t count = 0u;
+    *scanStatus = I2C_MSTR_NO_ERROR;
 
-	for(uint8_t addr = 0x03u; addr <= 0x77u; addr++)
+	for(uint8_t addr = I2C_FIRST_ADDRESS; addr <= I2C_LAST_ADDRESS; addr++)
 	{
-		if(i2c_probe_7bit_address(addr))
+		if(i2c_probe_7bit_address(addr, scanStatus))
 		{
 			if((addresses7bit != NULL) && (count < maxCount))
 			{
@@ -121,9 +119,32 @@ static uint8_t i2c_collect_available_addresses(uint8_t *addresses7bit, uint8_t m
 			}
 			count++;
 		}
+        if(*scanStatus != I2C_MSTR_NO_ERROR)
+        {
+            break;
+        }
 	}
 
 	return count;
+}
+
+static uint8_t i2c_scan_and_save_addresses(void)
+{
+    uint8_t addresses7bit[I2C_ADDRESS_COUNT];
+    uint8_t status;
+    uint8_t count = i2c_collect_available_addresses(addresses7bit,
+        (uint8_t)sizeof(addresses7bit), &status);
+
+    savedAddressCount = 0u;
+    if(status == I2C_MSTR_NO_ERROR)
+    {
+        for(uint8_t i = 0u; i < count; i++)
+        {
+            savedAddresses8bit[i] = (uint8_t)(addresses7bit[i] << 1);
+        }
+        savedAddressCount = count;
+    }
+    return status;
 }
 
 uint8_t prompt_sensor_address_8bit(uint8_t defaultAddress8bit)
@@ -133,8 +154,14 @@ uint8_t prompt_sensor_address_8bit(uint8_t defaultAddress8bit)
 	unsigned long parsedValue;
 	uint8_t detectedAddresses[16] = {0};
 	uint8_t detectedCount;
+    uint8_t scanStatus;
 
-	detectedCount = i2c_collect_available_addresses(detectedAddresses, (uint8_t)(sizeof(detectedAddresses) / sizeof(detectedAddresses[0])));
+	detectedCount = i2c_collect_available_addresses(detectedAddresses, (uint8_t)(sizeof(detectedAddresses) / sizeof(detectedAddresses[0])), &scanStatus);
+    if(scanStatus != I2C_MSTR_NO_ERROR)
+    {
+        printf("I2C scan failed: %u\r\n", scanStatus);
+        detectedCount = 0u;
+    }
 
 	if(detectedCount > 0u)
 	{
@@ -210,9 +237,8 @@ uint8_t prompt_sensor_address_8bit(uint8_t defaultAddress8bit)
 *******************************************************************************/
 CY_ISR(RxIsr)
 {
-    uint8 rxStatus;         
-    static char *rxData;
-    static int charcount = 0;
+    uint8 rxStatus;
+    static size_t charcount = 0u;
     
     do
     {
@@ -223,44 +249,188 @@ CY_ISR(RxIsr)
                         UART_RX_STS_STOP_ERROR | UART_RX_STS_OVERRUN)) != 0u)
         {
             /* ERROR handling. */
-            errorStatus |= rxStatus & ( UART_RX_STS_BREAK      | UART_RX_STS_PAR_ERROR | 
-                                        UART_RX_STS_STOP_ERROR | UART_RX_STS_OVERRUN);
+            if(!Isnewcommand)
+            {
+                errorStatus |= rxStatus & (UART_RX_STS_BREAK | UART_RX_STS_PAR_ERROR |
+                                          UART_RX_STS_STOP_ERROR | UART_RX_STS_OVERRUN);
+            }
         }
         
         if((rxStatus & UART_RX_STS_FIFO_NOTEMPTY) != 0u)
         {
-            /* Read data from the RX data register */
-            if(!receivingmsg){
-               rxData = rxbuffer;
-               receivingmsg = true;
-               charcount = 0;
-            }
-            if(charcount < MAX_CMD_SIZE && receivingmsg){
-                    *rxData = UART_RXDATA_REG;
-                    charcount++;
-                }
-            else
-                errorStatus = 1u;
-            
-            if(errorStatus == 0u)
+            uint8 data = UART_RXDATA_REG;
+            if(Isnewcommand)
             {
-                /*Check for \n end of transmission*/                
-                                
-				if(*rxData == '\n'){
-					Isnewcommand = true;
-					receivingmsg = false;
-					if((rxData > rxbuffer) && (*(rxData - 1) == '\r'))
-						*(rxData - 1)='\0';
-					else
-						*rxData='\0';
-				}
-                else
-                    rxData++;               
-                
+                continue;
+            }
+            if(!receivingmsg)
+            {
+                receivingmsg = true;
+                charcount = 0u;
+            }
+            if(data == '\n')
+            {
+                if((charcount > 0u) && (rxbuffer[charcount - 1u] == '\r'))
+                {
+                    charcount--;
+                }
+                if(charcount > MAX_JSON_SIZE)
+                {
+                    errorStatus |= RX_ERROR_OVERFLOW;
+                }
+                rxbuffer[charcount] = '\0';
+                receivingmsg = false;
+                Isnewcommand = true;
+            }
+            else if(data == '\0')
+            {
+                errorStatus |= RX_ERROR_INVALID_CHARACTER;
+            }
+            else if(charcount < MAX_CMD_SIZE - 1u)
+            {
+                rxbuffer[charcount++] = (char)data;
+            }
+            else
+            {
+                /* Always drain the FIFO and recover at the next newline. */
+                errorStatus |= RX_ERROR_OVERFLOW;
             }
         }
     }while((rxStatus & UART_RX_STS_FIFO_NOTEMPTY) != 0u);
 
+}
+
+static bool json_valid_id(const cJSON *id)
+{
+    return cJSON_IsNumber(id) && isfinite(id->valuedouble) &&
+           (id->valuedouble >= 0.0) && (id->valuedouble <= 9007199254740991.0) &&
+           (floor(id->valuedouble) == id->valuedouble);
+}
+
+static void json_send_response(const cJSON *request, const char *error)
+{
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(request, "type");
+    const cJSON *command = cJSON_GetObjectItemCaseSensitive(request, "command");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(request, "id");
+    cJSON *response = cJSON_CreateObject();
+    char *text = NULL;
+    char idText[32];
+
+    if(json_valid_id(id))
+    {
+        /* cJSON's default number formatting can round large integer IDs. */
+        (void)snprintf(idText, sizeof(idText), "%.0f", id->valuedouble);
+    }
+
+    if(response == NULL)
+    {
+        goto allocation_failed;
+    }
+    if((cJSON_IsString(type) ?
+        cJSON_AddStringToObject(response, "type", type->valuestring) :
+        cJSON_AddNullToObject(response, "type")) == NULL ||
+       (cJSON_IsString(command) ?
+        cJSON_AddStringToObject(response, "command", command->valuestring) :
+        cJSON_AddNullToObject(response, "command")) == NULL ||
+       (json_valid_id(id) ?
+         cJSON_AddRawToObject(response, "id", idText) :
+        cJSON_AddNullToObject(response, "id")) == NULL ||
+       cJSON_AddStringToObject(response, "status", error == NULL ? "ok" : "error") == NULL)
+    {
+        goto allocation_failed;
+    }
+    if(error != NULL)
+    {
+        if(cJSON_AddStringToObject(response, "error", error) == NULL)
+        {
+            goto allocation_failed;
+        }
+    }
+    text = cJSON_PrintUnformatted(response);
+    if(text == NULL)
+    {
+        goto allocation_failed;
+    }
+    if(error == NULL)
+    {
+        /* Stream the array to avoid one heap allocation per detected slave. */
+        text[strlen(text) - 1u] = '\0';
+        UART_PutString(text);
+        UART_PutString(",\"addresses\":[");
+        for(uint8_t i = 0u; i < savedAddressCount; i++)
+        {
+            char address[4];
+            (void)snprintf(address, sizeof(address), "%u", (unsigned int)savedAddresses8bit[i]);
+            if(i > 0u)
+            {
+                UART_PutString(",");
+            }
+            UART_PutString(address);
+        }
+        UART_PutString("]}\r\n");
+    }
+    else
+    {
+        UART_PutString(text);
+        UART_PutString("\r\n");
+    }
+    cJSON_free(text);
+    cJSON_Delete(response);
+    return;
+
+allocation_failed:
+    cJSON_Delete(response);
+    UART_PutString("{\"type\":null,\"command\":null,\"id\":null,"
+                   "\"status\":\"error\",\"error\":\"out_of_memory\"}\r\n");
+}
+
+static void json_process_command(const char *commandLine, uint16_t rxError)
+{
+    cJSON *request = NULL;
+    const char *error = NULL;
+
+    if(rxError != 0u)
+    {
+        error = (rxError & RX_ERROR_OVERFLOW) != 0u ? "command_too_long" :
+            ((rxError & RX_ERROR_INVALID_CHARACTER) != 0u ? "invalid_character" : "uart_receive_error");
+    }
+    else
+    {
+        request = cJSON_ParseWithOpts(commandLine, NULL, true);
+        if(request == NULL)
+        {
+            error = "invalid_json";
+        }
+        else if(!cJSON_IsObject(request))
+        {
+            error = "invalid_request";
+        }
+        else
+        {
+            const cJSON *type = cJSON_GetObjectItemCaseSensitive(request, "type");
+            const cJSON *command = cJSON_GetObjectItemCaseSensitive(request, "command");
+            const cJSON *id = cJSON_GetObjectItemCaseSensitive(request, "id");
+            if(!json_valid_id(id))
+            {
+                error = "invalid_id";
+            }
+            else if(!cJSON_IsString(type) || !cJSON_IsString(command))
+            {
+                error = "invalid_request";
+            }
+            else if((strcmp(type->valuestring, "configuration") != 0) ||
+                    (strcmp(command->valuestring, "scan_i2c") != 0))
+            {
+                error = "unsupported_command";
+            }
+            else if(i2c_scan_and_save_addresses() != I2C_MSTR_NO_ERROR)
+            {
+                error = "i2c_scan_failed";
+            }
+        }
+    }
+    json_send_response(request, error);
+    cJSON_Delete(request);
 }
 
 // Funzione per estrarre valori dal JSON
@@ -387,7 +557,6 @@ int main(void)
     CyGlobalIntEnable;  	
     
 	
-    uint32_t command_count = 0;
     VDAC8_Start();
     UART_Start() ;
     I2C_Start();
@@ -400,108 +569,17 @@ int main(void)
    
     //disable then enable sensor's I2C 
     CyDelay(2000);//wait setup end      
-    i2c_scan_and_print_table();
-    
-    /*
-    //enable sensor's I2C
-    LPn_OUT_Write(1); 
-    CyDelay(1000);//wait setup end   
-    i2c_scan_and_print_table();
-    */
+    (void)i2c_scan_and_save_addresses();
     
     SW_Running_LED_Write(1);
-	printf("0. initialize sensor\r\n");
-	printf("1. example1:ranging basic example\r\n");
-	printf("2. example2:get/set params example\r\n");
-	printf("3. example3:ranging mode example\r\n");
-	printf("4. example4:power mode example\r\n");
-	printf("5. example5:multiple targets per zone\r\n");
-	printf("6. example6:I2C and RAM optimization\r\n");
-	printf("7. example7:calibrate xtalk\r\n");
-	printf("8. example8:visualize xtalk data\r\n");
-	printf("9. example9:detection thresholds\r\n");
-	printf("10. example10:motion indicator\r\n");
-	printf("11. example11:motion + thresholds\r\n");
-	printf("12. example0:change address\r\n");
-	printf("13. example12:send ranging data to LabVIEW\r\n");
-	printf("Enter item number then ENTER\r\n");
 	for(cycles_count = 0;;cycles_count++)//forever loop
     {
-         
-        if(Isnewcommand){
-            printf("Loop Start\r\n");
-            //CLean Json msg
-            //clean_uart_string(rxbuffer);
-            //printf("\r\nCleaned UART data: '%s'\r\n", rxbuffer);
-
-			switch(atoi(rxbuffer))
-			{
-				case 0:
-					vl53l7cx_init_sensor_with_prompt();
-					break;
-				case 1:
-					example1();
-					break;
-				case 2:
-					example2();
-					break;
-				case 3:
-					example3();
-					break;
-				case 4:
-					example4();
-					break;
-				case 5:
-					example5();
-					break;
-				case 6:
-					example6();
-					break;
-				case 7:
-					example7();
-					break;
-				case 8:
-					example8();
-					break;
-				case 9:
-					example9();
-					break;
-				case 10:
-					example10();
-					break;
-				case 11:
-					example11();
-					break;
-				case 12:
-					example0();
-					break;
-				case 13:
-					example12();
-					break;
-				default:
-					printf("Invalid item. Please enter 0..13.\r\n");
-					break;
-			}
-           
-            printf("Cycle nbr= %u Command nbr= %u \r\n", cycles_count,++command_count);	
-            
-            Isnewcommand = false;
-			printf("0. initialize sensor\r\n");
-			printf("1. example1:ranging basic example\r\n");
-			printf("2. example2:get/set params example\r\n");
-			printf("3. example3:ranging mode example\r\n");
-			printf("4. example4:power mode example\r\n");
-			printf("5. example5:multiple targets per zone\r\n");
-			printf("6. example6:I2C and RAM optimization\r\n");
-			printf("7. example7:calibrate xtalk\r\n");
-			printf("8. example8:visualize xtalk data\r\n");
-			printf("9. example9:detection thresholds\r\n");
-			printf("10. example10:motion indicator\r\n");
-			printf("11. example11:motion + thresholds\r\n");
-			printf("12. example0:change address\r\n");
-			printf("13. example12:send ranging data to LabVIEW\r\n");
-			printf("Enter item number then ENTER\r\n");
-        }         
+        if(Isnewcommand)
+        {
+            char commandLine[MAX_CMD_SIZE];
+            uint16_t rxError = uart_take_command(commandLine, sizeof(commandLine));
+            json_process_command(commandLine, rxError);
+        }
     }
 }
 

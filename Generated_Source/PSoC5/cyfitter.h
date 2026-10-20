@@ -610,7 +610,7 @@
 #define BCLK__BUS_CLK__HZ 60000000U
 #define BCLK__BUS_CLK__KHZ 60000U
 #define BCLK__BUS_CLK__MHZ 60U
-#define CY_PROJECT_NAME "VL53L7CX_emulator_host_wprefetch_VSC"
+#define CY_PROJECT_NAME "VL53L7CX_emulator_host_LabView_wprefetch_VSC"
 #define CY_VERSION "PSoC Creator  4.4"
 #define CYDEV_CHIP_DIE_LEOPARD 1u
 #define CYDEV_CHIP_DIE_PSOC4A 26u

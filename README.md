@@ -39,6 +39,76 @@ Add/remove application source files through Creator as well as VS Code:
 Creator builds the files registered in its project, not every file in the folder.
 Do not manually edit generated files outside Creator's designated user sections.
 
+## LabVIEW JSON commands
+
+Hardware startup and interrupt-driven UART reception (`RxIsr`) are unchanged.
+After the existing startup delay, the host scans 7-bit I2C addresses
+`0x03..0x77` and saves the detected addresses without sending UART output.
+The main loop waits for `Isnewcommand`; the old numeric menu is no longer
+available. Existing sensor/example functions remain in the project.
+
+Send one JSON object per line, terminated by CRLF (`\r\n`). LF-only lines are
+also accepted. Allow startup to finish (including its 2-second delay and scan)
+before sending the first command. LabVIEW must wait for each complete response
+before sending another command; there is no command queue. Each JSON payload
+may contain at most 255 bytes, excluding the line terminator.
+
+The currently supported request is:
+
+```text
+{"type":"configuration","command":"scan_i2c","id":1}\r\n
+```
+
+Each request rescans the bus, replaces the saved addresses, and returns:
+
+```text
+{"type":"configuration","command":"scan_i2c","id":1,"status":"ok","addresses":[82,224]}\r\n
+```
+
+Addresses are ascending decimal **8-bit write addresses** (7-bit address shifted
+left once): `82` corresponds to `0x29`, and `224` corresponds to `0x70`.
+An empty bus returns `"status":"ok","addresses":[]`. An I2C failure other than
+an address NACK returns `i2c_scan_failed`, clears the saved address count, and
+does not return a partial address list. Startup scan failures remain silent;
+a subsequent scan command retries the bus and reports any failure.
+
+`type` and `command` are case-sensitive strings. `id` must be a nonnegative
+integer no greater than `9007199254740991` (the exact-integer limit of the JSON
+library's double representation). Responses echo these fields when valid;
+missing/invalid fields are `null`. All responses are compact JSON followed by
+CRLF, with no menu, scan table, or diagnostic text.
+
+Errors have `"status":"error"` and an `error` string, for example:
+
+```text
+{"type":"configuration","command":"scan_i2c","id":null,"status":"error","error":"invalid_id"}\r\n
+```
+
+Error codes are `invalid_json`, `invalid_request`, `invalid_id`,
+`unsupported_command`, `command_too_long`, `invalid_character` (embedded NUL),
+`uart_receive_error`, `i2c_scan_failed`, and `out_of_memory`.
+Unparseable or UART-damaged requests use `null` for all three correlation fields.
+Allocation failure also uses these `null` fields. Overlength or damaged input
+is drained through LF so the next request can be received normally.
+
+### Host regression tests
+
+With a Windows GCC installation, run these commands from the project folder.
+The tests compile the actual application code with mocked hardware and the
+existing cJSON implementation; no board is needed:
+
+```powershell
+$testExe = Join-Path $env:TEMP 'vl53l7cx-json-uart-tests.exe'
+gcc -std=gnu11 -I .\tests .\tests\json_uart_test.c .\cJSON.c -lm -o $testExe
+if ($LASTEXITCODE -eq 0) { & $testExe }
+Remove-Item -LiteralPath $testExe -ErrorAction SilentlyContinue
+```
+
+Coverage includes silent startup, exact response framing, rescanning, empty
+and fully populated buses, bus errors, ID validation/echoing, maximum line
+length, overflow/UART error recovery, pending-buffer protection, and response
+allocation failures.
+
 ## Git
 
 The repository is local to this project directory. Application sources, Creator
