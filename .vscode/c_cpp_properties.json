@@ -1,0 +1,19 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "PSoC5LP-ARM-GCC",
+      "compilerPath": "C:\\Program Files (x86)\\Cypress\\PSoC Creator\\4.4\\PSoC Creator\\import\\gnu\\arm\\5.4.1\\bin\\arm-none-eabi-gcc.exe",
+      "compilerArgs": [
+        "-mcpu=cortex-m3",
+        "-mthumb"
+      ],
+      "intelliSenseMode": "windows-gcc-arm",
+      "cStandard": "gnu11",
+      "includePath": [
+        "${workspaceFolder}",
+        "${workspaceFolder}\\Generated_Source\\PSoC5"
+      ]
+    }
+  ]
+}

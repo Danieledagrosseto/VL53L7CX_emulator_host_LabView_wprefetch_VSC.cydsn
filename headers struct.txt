@@ -1,0 +1,9 @@
+_api.h
+    |
+    |_api_stings.h
+    |
+    |_def.h
+    |
+    |_platform.h( Read /Write functions )
+        |
+        |_i2c_platform.h( read /write functions )

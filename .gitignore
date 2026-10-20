@@ -1,0 +1,26 @@
+# PSoC Creator per-user preferences and temporary design/build data
+*.cyprj.*
+*.cywrk.*
+*.cydwr.*
+codegentemp/
+codegentemp*/
+*_backup/
+*.rpt
+*.log
+*.bak
+*.tmp
+
+# Toolchain output (keep Generated_Source, including config.hex)
+ARM_GCC_*/
+ARM_MDK*/
+DP8051*/
+CortexM3/
+Export/
+
+# Editor and operating-system temporary files
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
